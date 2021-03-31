@@ -1,0 +1,12 @@
+hunter_config(
+        tvm
+        VERSION 0.6-t0
+        KEEP_PACKAGE_SOURCES
+        CMAKE_ARGS INSTALL_DEV=ON INSTALL_NNVM_SOURCES=ON USE_LLVM=OFF KEEP_SOURCE2=ON
+)
+
+hunter_config(
+        OpenCV
+        VERSION 4.2.0-t3
+        CMAKE_ARGS WITH_PNG=OFF WITH_JASPER=OFF
+)

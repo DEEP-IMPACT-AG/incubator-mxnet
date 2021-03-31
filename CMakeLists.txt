@@ -1,10 +1,17 @@
-cmake_minimum_required(VERSION 3.13)
+cmake_minimum_required(VERSION 3.16)
 
 # workaround to store CMAKE_CROSSCOMPILING because is getting reset by the project command
 if(CMAKE_CROSSCOMPILING)
   set(__CMAKE_CROSSCOMPILING ${CMAKE_CROSSCOMPILING})
   set(__CMAKE_CROSSCOMPILING_OVERRIDE ON)
 endif()
+
+include("cmake/HunterGate.cmake")
+HunterGate(
+        URL "https://github.com/DEEP-IMPACT-AG/hunter/archive/refs/tags/v0.23.295.t23.tar.gz"
+        SHA1 "0e6358c4a6214d6a419c538cc999287affdd6adc"
+        LOCAL
+)
 
 project(mxnet C CXX)
 
@@ -17,6 +24,8 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/build/private/local_config.cmake)
 endif()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Utils.cmake)
+
+include(CMakePrintHelpers)
 
 include(CMakeDependentOption)
 #Some things have order. This must be put in front alone
@@ -60,6 +69,7 @@ option(USE_VTUNE "Enable use of Intel Amplifier XE (VTune)" OFF) # one could set
 option(USE_TVM_OP "Enable use of TVM operator build system." OFF)
 option(ENABLE_CUDA_RTC "Build with CUDA runtime compilation support" ON)
 option(BUILD_CPP_EXAMPLES "Build cpp examples" ON)
+option(BUILD_TESTS          "Build tests" ON)
 option(INSTALL_EXAMPLES "Install the example source files." OFF)
 option(USE_SIGNAL_HANDLER "Print stack traces on segfaults." ON)
 option(USE_TENSORRT "Enable inference optimization with TensorRT." OFF)
@@ -119,6 +129,7 @@ endif()
 #Switch off modern thread local for dmlc-core, please see: https://github.com/dmlc/dmlc-core/issues/571#issuecomment-543467484
 add_definitions(-DDMLC_MODERN_THREAD_LOCAL=0)
 
+add_definitions(-DMSHADOW_USE_F16C=0)
 
 if(MSVC)
   add_definitions(-DWIN32_LEAN_AND_MEAN)
@@ -288,12 +299,32 @@ if(USE_MKLDNN)
   set(MKLDNN_USE_MKL NONE CACHE INTERNAL "" FORCE)
   set(MKLDNN_ENABLE_JIT_PROFILING OFF CACHE INTERNAL "" FORCE)
 
-  add_subdirectory(3rdparty/mkldnn)
+  if(HUNTER_ENABLED)
+    hunter_add_package(mkldnn)
+    find_package(mkldnn CONFIG REQUIRED)
 
-  include_directories(3rdparty/mkldnn/include)
-  include_directories(${PROJECT_BINARY_DIR}/3rdparty/mkldnn/include)
+    #There are a bunch of symlinks in include that points into 3rdparty/mkldnn/include which does not exist if hunter is used.
+    # Let's create a symlink 3rdparty/mkldnn/include that points to the correct folder (to the one that is downloaded by hunter)
+    set(include_link_from "${mxnet_SOURCE_DIR}/3rdparty/mkldnn/include")
+    set(include_link_to "${MKLDNN_ROOT}/include")
+    file(REMOVE ${include_link_from}) # See the next comment
+    execute_process(
+#           COMMAND  ${CMAKE_COMMAND} -E remove_directory ${include_link_from} # For whatever reason this does not work on my x64 linux machine
+            COMMAND ${CMAKE_COMMAND} -E create_symlink ${include_link_to} ${include_link_from}
+            OUTPUT_FILE ${include_link_from})
+  else()
+    add_subdirectory(3rdparty/mkldnn)
+    include_directories(3rdparty/mkldnn/include)
+    include_directories(${PROJECT_BINARY_DIR}/3rdparty/mkldnn/include)
+  endif()
+
   add_definitions(-DMXNET_USE_MKLDNN=1)
-  list(APPEND mxnet_LINKER_LIBS dnnl)
+
+  if(HUNTER_ENABLED)
+    list(APPEND mxnet_LINKER_LIBS MKLDNN::mkldnn)
+  else()
+    list(APPEND mxnet_LINKER_LIBS dnnl)
+  endif()
 endif()
 
 # Allow Cuda compiles outside of src tree to find things in 'src' and 'include'
@@ -324,12 +355,14 @@ foreach(var ${C_CXX_INCLUDE_DIRECTORIES})
 endforeach()
 
 include_directories("include")
+if(NOT HUNTER_ENABLED)
 include_directories("3rdparty/mshadow")
 include_directories("3rdparty/nvidia_cub")
 include_directories("3rdparty/tvm/nnvm/include")
 include_directories("3rdparty/tvm/include")
 include_directories("3rdparty/dmlc-core/include")
 include_directories("3rdparty/dlpack/include")
+endif()
 
 # commented out until PR goes through
 #if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/dlpack)
@@ -338,8 +371,8 @@ include_directories("3rdparty/dlpack/include")
 
 # Prevent stripping out symbols (operator registrations, for example)
 if(NOT MSVC AND NOT APPLE)
-  set(BEGIN_WHOLE_ARCHIVE -Wl,--whole-archive)
-  set(END_WHOLE_ARCHIVE -Wl,--no-whole-archive)
+  set(BEGIN_WHOLE_ARCHIVE -Xlinker --whole-archive)
+  set(END_WHOLE_ARCHIVE -Xlinker --no-whole-archive)
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   # using regular Clang or AppleClang
   set(BEGIN_WHOLE_ARCHIVE -Wl,-force_load)
@@ -385,10 +418,17 @@ endif()
 
 # ---[ OpenCV
 if(USE_OPENCV)
+  if(HUNTER_ENABLED)
+    hunter_add_package(OpenCV)
+    find_package(OpenCV CONFIG REQUIRED)
+  else()
+
   find_package(OpenCV COMPONENTS core highgui imgproc imgcodecs)
   if(NOT OpenCV_FOUND) # if not OpenCV 3.x, then imgcodecs are not found
     message(STATUS "OpenCV imgcodecs missing")
     find_package(OpenCV REQUIRED COMPONENTS core highgui imgproc)
+  endif()
+
   endif()
   include_directories(SYSTEM ${OpenCV_INCLUDE_DIRS})
   list(APPEND mxnet_LINKER_LIBS ${OpenCV_LIBS})
@@ -444,10 +484,15 @@ endif()
 
 # ---[ LAPack
 if(USE_LAPACK)
+  hunter_add_package(LAPACK)
+  if(HUNTER_ENABLED)
+    find_package(LAPACK CONFIG REQUIRED)
+  endif()
+
   message("USE_LAPACK is ON")
   add_definitions(-DMXNET_USE_LAPACK=1)
   if (NOT MSVC)
-    list(APPEND mxnet_LINKER_LIBS lapack)
+    list(APPEND mxnet_LINKER_LIBS lapack blas)
   endif()
 endif()
 
@@ -462,6 +507,8 @@ if(USE_JEMALLOC)
   endif()
 endif()
 
+if(NOT HUNTER_ENABLED)
+
 include(CTest)
 set(GTEST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/googletest/googletest")
 set(GTEST_INCLUDE_DIR ${GTEST_ROOT}/include)
@@ -472,6 +519,8 @@ set(GTEST_LIBRARY gtest)
 
 add_subdirectory(${GTEST_ROOT})
 find_package(GTest REQUIRED)
+
+endif()
 
 # cudnn detection
 if(USE_CUDNN)
@@ -486,13 +535,54 @@ if(USE_CUDNN)
   endif()
 endif()
 
+if(NOT HUNTER_ENABLED)
+
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/dmlc-core/cmake)
   add_subdirectory("3rdparty/dmlc-core")
 endif()
 
 add_subdirectory("3rdparty/mshadow")
+
+endif()
+
 FILE(GLOB_RECURSE SOURCE "src/*.cc" "src/*.h" "include/*.h")
 FILE(GLOB_RECURSE CUDA "src/*.cu" "src/*.cuh")
+
+if(HUNTER_ENABLED)
+  if(TARGET tvm)
+    if("${TVM_TOP_DIR}" STREQUAL "")
+      message(FATAL_ERROR "TVM_TOP_DIR is empty")
+    endif()
+
+    include_directories(${TVM_TOP_DIR}/include)
+    include_directories(${TVM_TOP_DIR}/nnvm/include)
+
+    FILE(GLOB_RECURSE NNVMSOURCE
+      ${TVM_TOP_DIR}/nnvm/src/c_api/*.cc
+      ${TVM_TOP_DIR}/nnvm/src/core/*.cc
+      ${TVM_TOP_DIR}/nnvm/src/pass/*.cc
+    )
+  else()
+    hunter_add_package(tvm)
+    find_package(tvm CONFIG REQUIRED)
+
+    #There are a bunch of symlinks in include that points into 3rdparty/... which does not exist if hunter is used.
+    # Let's create a symlink 3rdparty/... that points to the correct folder (to the one that is downloaded by hunter)
+    set(include_link_from "${mxnet_SOURCE_DIR}/3rdparty/tvm/nnvm")
+    set(include_link_to "${TVM_ROOT}/../Build/tvm/Source/nnvm")
+    file(REMOVE ${include_link_from}) # See the next comment
+    execute_process(
+            #COMMAND  ${CMAKE_COMMAND} -E remove_directory ${include_link_from} # For whatever reason this does not work on my x64 linux machine
+            COMMAND ${CMAKE_COMMAND} -E create_symlink ${include_link_to} ${include_link_from}
+            OUTPUT_FILE ${include_link_from})
+
+    FILE(GLOB_RECURSE NNVMSOURCE
+      ${TVM_ROOT}/src/tvm/nnvm/c_api/*.cc
+      ${TVM_ROOT}/src/tvm/nnvm/core/*.cc
+      ${TVM_ROOT}/src/tvm/nnvm/pass/*.cc
+    )
+  endif()
+else()
 
 # add nnvm to source
 FILE(GLOB_RECURSE NNVMSOURCE
@@ -503,11 +593,16 @@ FILE(GLOB_RECURSE NNVMSOURCE
   3rdparty/tvm/nnvm/src/core/*.h
   3rdparty/tvm/nnvm/src/pass/*.h
   3rdparty/tvm/nnvm/include/*.h)
+
+endif()
+
 list(APPEND SOURCE ${NNVMSOURCE})
 
+if(NOT HUNTER_ENABLED)
 # add mshadow file
 FILE(GLOB_RECURSE MSHADOWSOURCE "3rdparty/mshadow/mshadow/*.h")
 FILE(GLOB_RECURSE MSHADOW_CUDASOURCE "3rdparty/mshadow/mshadow/*.cuh")
+endif()
 list(APPEND SOURCE ${MSHADOWSOURCE})
 list(APPEND CUDA ${MSHADOW_CUDASOURCE})
 
@@ -589,6 +684,8 @@ if(MSVC)
   endforeach(flag_var)
 endif()
 
+set(mxnet_install_rpath "")
+
 if(USE_CUDA)
   # CUDA_SELECT_NVCC_ARCH_FLAGS is not deprecated, though part of deprecated
   # FindCUDA https://gitlab.kitware.com/cmake/cmake/issues/19199
@@ -612,7 +709,7 @@ if(USE_CUDA)
   list(APPEND mxnet_LINKER_LIBS CUDA::cudart CUDA::cublas CUDA::cufft CUDA::cusolver CUDA::curand)
   if(ENABLE_CUDA_RTC)
     if(CUDA_nvrtc_LIBRARY)
-      list(APPEND mxnet_LINKER_LIBS CUDA::nvrtc cuda)
+	list(APPEND mxnet_LINKER_LIBS CUDA::nvrtc cuda)
       add_definitions(-DMXNET_ENABLE_CUDA_RTC=1)
     else()
       message(FATAL_ERROR "ENABLE_CUDA_RTC=ON, but failed to find NVRTC. CMake will exit." )
@@ -621,7 +718,7 @@ if(USE_CUDA)
   list(APPEND SOURCE ${CUDA})
   add_definitions(-DMXNET_USE_CUDA=1)
   add_definitions(-DMSHADOW_USE_CUDA=1)
-	add_definitions(-DMSHADOW_FORCE_STREAM)
+  add_definitions(-DMSHADOW_FORCE_STREAM)
 
   if(USE_NCCL)
     find_package(NCCL)
@@ -673,22 +770,53 @@ else()
 
 endif()
 
+# Get all propreties that cmake supports
+execute_process(COMMAND cmake --help-property-list OUTPUT_VARIABLE CMAKE_PROPERTY_LIST)
+
+# Convert command output into a CMake list
+STRING(REGEX REPLACE ";" "\\\\;" CMAKE_PROPERTY_LIST "${CMAKE_PROPERTY_LIST}")
+STRING(REGEX REPLACE "\n" ";" CMAKE_PROPERTY_LIST "${CMAKE_PROPERTY_LIST}")
+
 add_library(sample_lib SHARED ${CMAKE_CURRENT_SOURCE_DIR}/example/lib_api/mylib.cc)
 target_include_directories(sample_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/mxnet)
 set(MXNET_INSTALL_TARGETS mxnet)
 if(UNIX)
   string(APPEND CMAKE_CUDA_FLAGS "${CUDA_ARCH_FLAGS_SPACES}")
-  # Create dummy file since we want an empty shared library before linking
-  set(DUMMY_SOURCE ${CMAKE_BINARY_DIR}/dummy.c)
-  file(WRITE ${DUMMY_SOURCE} "")
-  list(APPEND MXNET_INSTALL_TARGETS mxnet_static)
-  add_library(mxnet_static STATIC ${SOURCE})
-  add_library(mxnet SHARED ${DUMMY_SOURCE})
-  target_link_libraries(mxnet PRIVATE ${BEGIN_WHOLE_ARCHIVE} $<TARGET_FILE:mxnet_static> ${END_WHOLE_ARCHIVE})
-  target_link_libraries(mxnet PRIVATE mxnet_static)
-  target_link_libraries(mxnet_static PUBLIC ${CMAKE_DL_LIBS})
+  add_library(mxnet SHARED ${SOURCE})
+
+  target_include_directories(
+      mxnet PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/src/c_api>
+  )
+
+  if(HUNTER_ENABLED)
+    hunter_add_package(dmlc-core)
+    find_package(dmlc CONFIG REQUIRED)
+    target_link_libraries(mxnet PUBLIC dmlc::dmlc)
+
+    hunter_add_package(mshadow)
+    find_package(mshadow CONFIG REQUIRED)
+    target_link_libraries(mxnet PUBLIC mshadow::mshadow)
+
+    hunter_add_package(cub)
+    find_package(cub CONFIG REQUIRED)
+    target_link_libraries(mxnet PUBLIC cub::cub)
+
+    if(USE_MKLDNN)
+      hunter_add_package(mkldnn)
+      find_package(mkldnn CONFIG REQUIRED)
+      target_link_libraries(mxnet PUBLIC MKLDNN::mkldnn)
+    endif()
+
+    hunter_add_package(dlpack)
+    find_package(dlpack CONFIG REQUIRED)
+  endif()
+
+  #target_link_libraries(mxnet_static PUBLIC ${CMAKE_DL_LIBS})
   target_compile_options(sample_lib PUBLIC -shared)
-  set_target_properties(mxnet_static PROPERTIES OUTPUT_NAME mxnet)
+
+  if(NOT "${mxnet_install_rpath}" STREQUAL "")
+    set_target_properties(mxnet PROPERTIES INSTALL_RPATH ${mxnet_install_rpath})
+  endif()
 elseif(MSVC)
   target_compile_options(sample_lib PUBLIC /LD)
   set_target_properties(sample_lib PROPERTIES PREFIX "lib")
@@ -798,7 +926,9 @@ if(MSVC)
   endif()
 else()
   target_link_libraries(mxnet PUBLIC ${mxnet_LINKER_LIBS})
-  target_link_libraries(mxnet PUBLIC dmlc)
+  if (NOT TARGET dmlc::dmlc)
+    target_link_libraries(mxnet PUBLIC dmlc)
+  endif()
 endif()
 
 if(USE_OPENCV AND OpenCV_VERSION_MAJOR GREATER 2)
@@ -806,12 +936,12 @@ if(USE_OPENCV AND OpenCV_VERSION_MAJOR GREATER 2)
   if(MSVC)
     target_link_libraries(im2rec mxnet)
   else()
-    target_link_libraries(im2rec ${BEGIN_WHOLE_ARCHIVE} mxnet_static ${END_WHOLE_ARCHIVE})
+    target_link_libraries(im2rec ${BEGIN_WHOLE_ARCHIVE} mxnet ${END_WHOLE_ARCHIVE})
   endif()
   target_link_libraries(im2rec
     ${mxnet_LINKER_LIBS}
     ${OpenCV_LIBS}
-    dmlc
+    dmlc::dmlc
     ${pslite_LINKER_LIBS}
     )
 else()
@@ -824,27 +954,84 @@ if(MSVC AND USE_MXNET_LIB_NAMING)
   set_target_properties(mxnet PROPERTIES OUTPUT_NAME "libmxnet")
 endif()
 
-add_subdirectory(tests)
+if(BUILD_TESTS)
+  add_subdirectory(tests)
+endif()
 
+### Installation (https://github.com/forexample/package-example) {
+
+# Introduce variables:
+# * CMAKE_INSTALL_LIBDIR
+# * CMAKE_INSTALL_BINDIR
+# * CMAKE_INSTALL_INCLUDEDIR
 include(GNUInstallDirs)
+
+set(config_install_dir "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}")
+set(generated_dir "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(project_config "${generated_dir}/${PROJECT_NAME}Config.cmake")
+set(TARGETS_EXPORT_NAME "${PROJECT_NAME}Targets")
+set(namespace "${PROJECT_NAME}::")
+
+include(CMakePackageConfigHelpers)
+
+# Use:
+# * TARGETS_EXPORT_NAME
+# * PROJECT_NAME
+configure_package_config_file(
+    "cmake/template/Config.cmake.in"
+    "${project_config}"
+    INSTALL_DESTINATION "${config_install_dir}"
+)
+
+install(
+    FILES "${project_config}"
+    DESTINATION "${config_install_dir}"
+)
+
+install(
+    EXPORT "${TARGETS_EXPORT_NAME}"
+    NAMESPACE "${namespace}"
+    DESTINATION "${config_install_dir}"
+)
+
+### }
+
+set(pip_install_suffix "${CMAKE_INSTALL_LIBDIR}/python/site-packages")
+
+install(
+    DIRECTORY python/
+    DESTINATION ${pip_install_suffix}
+    FILES_MATCHING
+    PATTERN "*"
+    REGEX "\.gitignore$" EXCLUDE
+    REGEX "setup\.py$" EXCLUDE
+    REGEX "README\.md$" EXCLUDE
+)
+
 install(TARGETS ${MXNET_INSTALL_TARGETS}
+  EXPORT ${TARGETS_EXPORT_NAME}
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  LIBRARY DESTINATION ${pip_install_suffix}/mxnet
+  ARCHIVE DESTINATION ${pip_install_suffix}/mxnet
+  INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 
 # NOTE: Public headers will be installed into ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_INCLUDEDIR}, see
 #       https://cmake.org/cmake/help/v3.0/variable/CMAKE_INSTALL_PREFIX.html
 #       https://cmake.org/cmake/help/v3.0/module/GNUInstallDirs.html
 
+if(NOT HUNTER_ENABLED)
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/dlpack/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/dmlc-core/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 if(USE_MKLDNN)
   install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/mkldnn/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif()
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/mshadow/mshadow/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mshadow)
+endif()
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/mxnet/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mxnet)
+if(NOT HUNTER_ENABLED)
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/tvm/nnvm/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+endif()
 if (INSTALL_EXAMPLES)
   install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/example  DESTINATION ${CMAKE_INSTALL_DATADIR}/${PROJECT_NAME})
 endif()
@@ -904,3 +1091,11 @@ if(BUILD_CYTHON_MODULES)
     message(FATAL_ERROR "No python interpreter found to build cython modules")
   endif()
 endif()
+
+if (UNIX)
+  if (HUNTER_ENABLED)
+    target_link_libraries(mxnet PUBLIC gfortran)
+  endif()
+endif()
+
+
